@@ -1202,6 +1202,35 @@
                     <div class="smallNote">
                         Manual stim is always available. NeuroProtocol (below) can override it if enabled.
                     </div>
+
+                    <div class="hr"></div>
+                    <div class="grid2" style="margin-top:10px;">
+                        <div class="control">
+                            <label>Deterministic RNG seed <span class="value" id="valSeed">123456789</span></label>
+                            <input id="inpSeed" type="number" min="0" max="4294967295" step="1" value="123456789" />
+                        </div>
+                        <div class="control">
+                            <label>Noise RNG source <span class="value" id="valRngMode">Seeded</span></label>
+                            <select id="selRngMode">
+                                <option value="seeded" selected>Seeded (reproducible)</option>
+                                <option value="system">System random</option>
+                            </select>
+                        </div>
+                    </div>
+                    <div class="grid2" style="margin-top:10px;">
+                        <div class="control">
+                            <label>Reseed on Reset <span class="value" id="valReseedReset">ON</span></label>
+                            <select id="selReseedReset">
+                                <option value="on" selected>On</option>
+                                <option value="off">Off</option>
+                            </select>
+                        </div>
+                        <div class="control"></div>
+                    </div>
+                    <div class="tinyRow" style="margin-top:10px;">
+                        <button id="btnReseed">Reseed RNG</button>
+                        <button id="btnRandomSeed">Randomize Seed</button>
+                    </div>
                 </div>
 
                 <div class="section">
@@ -1396,6 +1425,8 @@
                         <div class="tinyRow"><button id="btnCopy">Copy</button><button
                                 id="btnPaste">Paste</button><button id="btnApply" class="primary">Apply Text</button>
                         </div>
+                        <div class="tinyRow" style="margin-top:4px;"><button id="btnManifestCopy">Copy Run Manifest</button><button
+                                id="btnManifestExport">Export Manifest</button></div>
                     </div>
                 </div>
 
@@ -1697,6 +1728,26 @@
             const COLLAPSE_STORAGE_KEY = "cablelab_collapsed_sections_v1";
             const MAX_SNAPSHOTS = 8;
 
+            function normalizeSeed(seed) {
+                const n = Number(seed);
+                if (!Number.isFinite(n)) return 1;
+                return (Math.floor(n) >>> 0) || 1;
+            }
+            function simpleHash(str) {
+                let h = 2166136261 >>> 0;
+                const txt = String(str || "");
+                for (let i = 0; i < txt.length; i++) {
+                    h ^= txt.charCodeAt(i);
+                    h = Math.imul(h, 16777619);
+                }
+                return (h >>> 0).toString(16).padStart(8, "0");
+            }
+
+            function makeRunId() {
+                const stamp = new Date().toISOString().replace(/[-:.TZ]/g, "").slice(0, 14);
+                return `run_${stamp}_${(Math.floor(Math.random() * 0xFFFF) >>> 0).toString(16).padStart(4, "0")}`;
+            }
+
             function downloadBlob(blob, filename) {
                 const a = document.createElement("a");
                 a.href = URL.createObjectURL(blob);
@@ -1769,6 +1820,27 @@
 
             let noiseAmp = 0.0;
             let noiseLPHz = 30;
+            let rngSeed = 123456789;
+            let rngState = normalizeSeed(rngSeed);
+            let reseedOnReset = true;
+            let rngMode = "seeded"; // seeded | system
+
+            function setRngSeed(seed, syncInput = true) {
+                rngSeed = normalizeSeed(seed);
+                rngState = rngSeed;
+                if ($("valSeed")) $("valSeed").textContent = String(rngSeed);
+                if (syncInput && $("inpSeed")) $("inpSeed").value = String(rngSeed);
+            }
+
+            function seededRandom() {
+                rngState = (rngState + 0x6D2B79F5) >>> 0;
+                let t = rngState;
+                t = Math.imul(t ^ (t >>> 15), t | 1);
+                t ^= t + Math.imul(t ^ (t >>> 7), t | 61);
+                return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+            }
+
+            const signedNoise = () => ((rngMode === "system" ? Math.random() : seededRandom()) * 2 - 1);
 
             // DSL
             let useDSL = true;
@@ -1800,6 +1872,8 @@
 
             // Time
             let t_ms = 0;
+            let runId = makeRunId();
+            let runStartedAt = new Date().toISOString();
 
             // Arrays (typed)
             let V, m, h, n, w;
@@ -2090,7 +2164,7 @@
             function getStochasticNoise(a, b, s, dt, nc) {
                 if (!stochasticOn || nc <= 0) return 0;
                 const var_c = Math.max(0, (a * (1 - s) + b * s) / (nc * dt));
-                return Math.sqrt(var_c) * (Math.random() * 2 - 1) * 1.732;
+                return Math.sqrt(var_c) * signedNoise() * 1.732;
             }
 
             // -----------------------------
@@ -2125,7 +2199,7 @@
                 }
 
                 if (noiseAmp !== 0) {
-                    const white = (Math.random() * 2 - 1) * noiseAmp;
+                    const white = signedNoise() * noiseAmp;
                     noiseState = onePoleLP(noiseState, white, noiseLPHz, dt_ms_local);
                     I0 += noiseState;
                 }
@@ -2378,7 +2452,7 @@
                     } else if (seg.type === "noise") {
                         const amp = seg.params.amp ?? 0.5;
                         const lp = seg.params.lp ?? 30;
-                        const white = (Math.random() * 2 - 1) * amp;
+                        const white = signedNoise() * amp;
                         this._noise = onePoleLP(this._noise, white, lp, dtMs);
                         I0 = this._noise;
                     } else if (seg.type === "ramp") {
@@ -2549,7 +2623,9 @@
                 }
 
                 t_ms = 0;
+                beginNewRun();
                 noiseState = 0;
+                if (reseedOnReset) setRngSeed(rngSeed);
                 prevVprobe = V[probeIdx];
                 spikeTimes = [];
                 rbVt.clear(); rbI0.clear(); rbRate.clear();
@@ -2951,7 +3027,7 @@
                     const d = buf.getChannelData(0);
                     for (let i = 0; i < len; i++) {
                         const env = Math.exp(-i / (sr * 0.004));
-                        d[i] = (Math.random() * 2 - 1) * env;
+                        d[i] = signedNoise() * env;
                     }
                     const src = this.ctx.createBufferSource();
                     src.buffer = buf;
@@ -3184,7 +3260,7 @@
                                         I0 += stimCfg.sineAmp * Math.sin(2 * Math.PI * stimCfg.sineFreqHz * (tms * 1e-3) + ph);
                                     }
                                     if (stimCfg.noiseAmp !== 0) {
-                                        const white = (Math.random() * 2 - 1) * stimCfg.noiseAmp;
+                                        const white = signedNoise() * stimCfg.noiseAmp;
                                         noiseSt = onePoleLP(noiseSt, white, stimCfg.noiseLPHz, dtMs);
                                         I0 += noiseSt;
                                     }
@@ -3249,7 +3325,7 @@
                                         const dd = buf.getChannelData(0);
                                         for (let i = 0; i < len; i++) {
                                             const env = Math.exp(-i / (sampleRate * 0.004));
-                                            dd[i] = (Math.random() * 2 - 1) * env;
+                                            dd[i] = signedNoise() * env;
                                         }
                                         const src = ctx.createBufferSource(); src.buffer = buf;
                                         const g = ctx.createGain();
@@ -3711,6 +3787,42 @@
                 setR("rngPSine", sinePhaseDeg);
                 setR("rngINoise", noiseAmp);
                 setR("rngNoiseLP", noiseLPHz);
+                if ($("inpSeed")) $("inpSeed").value = String(rngSeed);
+                if ($("valSeed")) $("valSeed").textContent = String(rngSeed);
+                if ($("selRngMode")) {
+                    $("selRngMode").value = rngMode;
+                    $("valRngMode").textContent = rngMode === "seeded" ? "Seeded" : "System";
+                }
+                if ($("selReseedReset")) {
+                    $("selReseedReset").value = reseedOnReset ? "on" : "off";
+                    $("valReseedReset").textContent = reseedOnReset ? "ON" : "OFF";
+                }
+            }
+
+            function beginNewRun() {
+                runId = makeRunId();
+                runStartedAt = new Date().toISOString();
+            }
+
+            function exportRunManifest() {
+                const protocolText = $("txtDSL")?.value || "";
+                return {
+                    manifestVersion: 1,
+                    runId,
+                    runStartedAt,
+                    exportedAt: new Date().toISOString(),
+                    engine: { integrator, dt, stepsPerFrame, windowMs },
+                    cable: { N, gAx, dx_um, bc },
+                    stimulus: { stimIdx, stimSigma, probeIdx, useDSL, loopProto },
+                    rng: { rngSeed, rngMode, reseedOnReset },
+                    protocol: {
+                        enabled: useDSL,
+                        compiled: proto.compiled,
+                        template: dslTemplateKey,
+                        hash: simpleHash(protocolText),
+                        lines: protocolText.split(/\n/).length
+                    }
+                };
             }
 
             // -----------------------------
@@ -3749,6 +3861,7 @@
                         IDC, pulseAmp, pulsePeriodMs, pulseDutyPct, pulseOn,
                         sineAmp, sineFreqHz, sinePhaseDeg,
                         noiseAmp, noiseLPHz,
+                        rngSeed, rngMode, reseedOnReset,
                         useDSL, loopProto
                     },
                     proto: { compiled: proto.compiled, text: $("txtDSL").value || "", live: liveProtoCompile, template: dslTemplateKey },
@@ -3757,6 +3870,8 @@
                     innovation: innovationState,
                     state: {
                         t_ms,
+                        runId,
+                        runStartedAt,
                         V: Array.from(V),
                         m: Array.from(m),
                         h: Array.from(h),
@@ -3808,6 +3923,9 @@
 
                 noiseAmp = st.stim?.noiseAmp ?? noiseAmp;
                 noiseLPHz = st.stim?.noiseLPHz ?? noiseLPHz;
+                setRngSeed(st.stim?.rngSeed ?? rngSeed);
+                rngMode = (st.stim?.rngMode === "system") ? "system" : "seeded";
+                reseedOnReset = st.stim?.reseedOnReset ?? reseedOnReset;
 
                 useDSL = st.stim?.useDSL ?? useDSL;
                 loopProto = st.stim?.loopProto ?? loopProto;
@@ -3859,6 +3977,8 @@
                 // load state vectors if present
                 if (st.state?.V && st.state.V.length === N) {
                     t_ms = st.state.t_ms ?? 0;
+                    runId = st.state.runId || runId;
+                    runStartedAt = st.state.runStartedAt || runStartedAt;
                     const hasW = Array.isArray(st.state.w) && st.state.w.length === N;
                     for (let i = 0; i < N; i++) {
                         V[i] = st.state.V[i];
@@ -4085,6 +4205,31 @@ block 400ms off
             bindRange("rngINoise", "valINoise", x => x.toFixed(2), x => { noiseAmp = x; });
             bindRange("rngNoiseLP", "valNoiseLP", x => String(x | 0), x => { noiseLPHz = x | 0; });
 
+            if ($("inpSeed")) {
+                $("inpSeed").addEventListener("change", (e) => setRngSeed(e.target.value));
+            }
+            if ($("btnReseed")) {
+                $("btnReseed").addEventListener("click", () => setRngSeed(rngSeed));
+            }
+            if ($("btnRandomSeed")) {
+                $("btnRandomSeed").addEventListener("click", () => {
+                    const randomSeed = Math.floor(Math.random() * 0xFFFFFFFF) >>> 0;
+                    setRngSeed(randomSeed || 1);
+                });
+            }
+            if ($("selRngMode")) {
+                $("selRngMode").addEventListener("change", (e) => {
+                    rngMode = (e.target.value === "system") ? "system" : "seeded";
+                    $("valRngMode").textContent = rngMode === "seeded" ? "Seeded" : "System";
+                });
+            }
+            if ($("selReseedReset")) {
+                $("selReseedReset").addEventListener("change", (e) => {
+                    reseedOnReset = (e.target.value === "on");
+                    $("valReseedReset").textContent = reseedOnReset ? "ON" : "OFF";
+                });
+            }
+
             $("btnStimNone").addEventListener("click", () => setManualPreset("none"));
             $("btnStimExcite").addEventListener("click", () => setManualPreset("excite"));
             $("btnStimBurst").addEventListener("click", () => setManualPreset("burst"));
@@ -4252,6 +4397,24 @@ block 400ms off
                 try { applyState(JSON.parse($("txtJSON").value)); }
                 catch (e) { alert("Apply failed: " + (e?.message || String(e))); }
             });
+            if ($("btnManifestCopy")) {
+                $("btnManifestCopy").addEventListener("click", async () => {
+                    const txt = JSON.stringify(exportRunManifest(), null, 2);
+                    try { await navigator.clipboard.writeText(txt); }
+                    catch (e) {
+                        $("txtJSON").value = txt;
+                        $("txtJSON").select();
+                        document.execCommand("copy");
+                    }
+                });
+            }
+            if ($("btnManifestExport")) {
+                $("btnManifestExport").addEventListener("click", () => {
+                    const txt = JSON.stringify(exportRunManifest(), null, 2);
+                    const blob = new Blob([txt], { type: "application/json" });
+                    downloadBlob(blob, `cablelab_manifest_${runId}.json`);
+                });
+            }
             const btnStore = $("btnStore");
             if (btnStore) {
                 btnStore.addEventListener("click", () => {
@@ -5621,6 +5784,7 @@ block 400ms off
                 if ($("selDSLLive")) { $("selDSLLive").value = liveProtoCompile ? "on" : "off"; $("selDSLLive").dispatchEvent(new Event("change")); }
                 if ($("selDSLTemplate")) $("selDSLTemplate").value = dslTemplateKey;
                 if ($("txtDSL")) compileProtocol({ silent: true, alertOnSuccess: false });
+                setRngSeed(rngSeed);
 
                 resetCable();
                 resetPhase();
